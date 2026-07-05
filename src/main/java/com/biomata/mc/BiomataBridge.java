@@ -80,11 +80,35 @@ public final class BiomataBridge {
         return ws != null && !registeredAgents.isEmpty();
     }
 
-    /** Register one agent driven by a local Ollama LLM. */
-    public void registerAgent(String agentId) {
+    private static final String DEFAULT_PROMPT =
+        "You are a curious character exploring a Minecraft world. You love to roam. "
+        + "Strongly prefer the 'move' action, and when you move include target_x "
+        + "and target_z coordinates a short distance from your current position.";
+
+    /** Register one agent driven by a local Ollama LLM. `prompt` null → default. */
+    public void registerAgent(String agentId, String prompt) {
         WebSocket s = ws;
         if (s == null) return;
+        s.sendText(registerFrame(agentId, prompt == null ? DEFAULT_PROMPT : prompt), true);
+    }
 
+    /**
+     * Change an agent's system prompt. The engine sets brain config at register
+     * time, so this re-registers: remove_agent then register_agent, chained so
+     * the two sends don't overlap and the engine sees the remove first.
+     */
+    public void setPrompt(String agentId, String prompt) {
+        WebSocket s = ws;
+        if (s == null) return;
+        JsonObject rm = new JsonObject();
+        rm.addProperty("agent_id", agentId);
+        String removeFrame = request("remove_agent", rm);
+        String registerFrame = registerFrame(agentId, prompt);
+        s.sendText(removeFrame, true).thenCompose(v -> s.sendText(registerFrame, true));
+    }
+
+    /** Build a register_agent frame for one Ollama-driven agent. */
+    private String registerFrame(String agentId, String prompt) {
         JsonObject llm = new JsonObject();
         llm.addProperty("model", MODEL);
         llm.addProperty("base_url", "http://localhost:11434");
@@ -99,15 +123,12 @@ public final class BiomataBridge {
         JsonObject personality = new JsonObject();
         personality.add("traits", traits);
         personality.add("goals", goals);
-        personality.addProperty("backstory", "A pig with wanderlust in a blocky world.");
+        personality.addProperty("backstory", "A wanderer with wanderlust in a blocky world.");
 
         JsonObject brainConfig = new JsonObject();
         brainConfig.add("llm_config", llm);
         brainConfig.add("personality", personality);
-        brainConfig.addProperty("system_prompt",
-            "You are a curious pig exploring a Minecraft world. You love to roam. "
-            + "Strongly prefer the 'move' action, and when you move include target_x "
-            + "and target_z coordinates a short distance from your current position.");
+        brainConfig.addProperty("system_prompt", prompt);
 
         JsonObject params = new JsonObject();
         params.addProperty("agent_id", agentId);
@@ -115,7 +136,7 @@ public final class BiomataBridge {
         params.addProperty("brain_class", BRAIN_CLASS);
         params.add("brain_config", brainConfig);
         params.add("capabilities", new JsonArray());
-        s.sendText(request("register_agent", params), true);
+        return request("register_agent", params);
     }
 
     /** Unregister one agent from the engine and forget its state. */

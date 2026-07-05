@@ -17,8 +17,9 @@ import net.minecraft.resources.Identifier;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.EntitySpawnReason;
+import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.EntityTypes;
-import net.minecraft.world.entity.animal.pig.Pig;
+import net.minecraft.world.entity.Mob;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -32,8 +33,16 @@ public class BiomataMinecraft implements ModInitializer {
 
 	private static final BiomataBridge BRIDGE = new BiomataBridge();
 
+	/**
+	 * Character palette for `/biomata spawn <id> <type>`. Biomata drives NPC
+	 * characters only — humanoid, non-hostile. Animals and monsters are out.
+	 */
+	private static final Map<String, EntityType<? extends Mob>> CHARACTER_TYPES = Map.of(
+		"villager", EntityTypes.VILLAGER,
+		"wandering_trader", EntityTypes.WANDERING_TRADER);
+
 	/** agentId -> the entity it drives. Server-thread only. */
-	private static final Map<String, Pig> AGENTS = new LinkedHashMap<>();
+	private static final Map<String, Mob> AGENTS = new LinkedHashMap<>();
 
 	private static int serverTicks;
 
@@ -54,7 +63,17 @@ public class BiomataMinecraft implements ModInitializer {
 			dispatcher.register(Commands.literal("biomata")
 				.then(Commands.literal("spawn")
 					.then(Commands.argument("id", StringArgumentType.word())
-						.executes(BiomataMinecraft::cmdSpawn)))
+						.executes(ctx -> cmdSpawn(ctx, "villager"))
+						.then(Commands.argument("type", StringArgumentType.word())
+							.suggests((c, b) -> {
+								CHARACTER_TYPES.keySet().forEach(b::suggest);
+								return b.buildFuture();
+							})
+							.executes(ctx -> cmdSpawn(ctx, StringArgumentType.getString(ctx, "type"))))))
+				.then(Commands.literal("prompt")
+					.then(Commands.argument("id", StringArgumentType.word())
+						.then(Commands.argument("text", StringArgumentType.greedyString())
+							.executes(BiomataMinecraft::cmdPrompt))))
 				.then(Commands.literal("remove")
 					.then(Commands.argument("id", StringArgumentType.word())
 						.executes(BiomataMinecraft::cmdRemove)))
@@ -67,7 +86,7 @@ public class BiomataMinecraft implements ModInitializer {
 			if (AGENTS.isEmpty()) return;
 
 			for (var e : AGENTS.entrySet()) {
-				Pig p = e.getValue();
+				Mob p = e.getValue();
 				if (p.isRemoved()) continue;
 				double[] t = BRIDGE.moveTargets.get(e.getKey());
 				if (t != null && p.getNavigation().isDone()) {
@@ -87,7 +106,7 @@ public class BiomataMinecraft implements ModInitializer {
 			if (++serverTicks % 100 == 0 && BRIDGE.isReady() && !BRIDGE.isTickInFlight()) {
 				Map<String, double[]> positions = new LinkedHashMap<>();
 				for (var e : AGENTS.entrySet()) {
-					Pig p = e.getValue();
+					Mob p = e.getValue();
 					if (!p.isRemoved()) {
 						positions.put(e.getKey(), new double[] {p.getX(), p.getY(), p.getZ()});
 					}
@@ -97,31 +116,50 @@ public class BiomataMinecraft implements ModInitializer {
 		});
 	}
 
-	private static int cmdSpawn(CommandContext<CommandSourceStack> ctx) throws CommandSyntaxException {
+	private static int cmdSpawn(CommandContext<CommandSourceStack> ctx, String type) throws CommandSyntaxException {
 		String id = StringArgumentType.getString(ctx, "id");
 		CommandSourceStack src = ctx.getSource();
 		if (AGENTS.containsKey(id)) {
 			src.sendFailure(Component.literal("agent already exists: " + id));
 			return 0;
 		}
+		EntityType<? extends Mob> entityType = CHARACTER_TYPES.get(type.toLowerCase());
+		if (entityType == null) {
+			src.sendFailure(Component.literal(
+				"unknown character type '" + type + "'. options: " + String.join(", ", CHARACTER_TYPES.keySet())));
+			return 0;
+		}
 		ServerPlayer player = src.getPlayerOrException();
 		ServerLevel level = player.level();
 		BlockPos pos = player.blockPosition().offset(2, 0, 0);
-		Pig p = EntityTypes.PIG.spawn(level, pos, EntitySpawnReason.COMMAND);
+		Mob p = entityType.spawn(level, pos, EntitySpawnReason.COMMAND);
 		if (p == null) {
 			src.sendFailure(Component.literal("spawn failed"));
 			return 0;
 		}
 		AGENTS.put(id, p);
-		BRIDGE.registerAgent(id);
-		src.sendSuccess(() -> Component.literal("spawned agent '" + id + "'"), false);
+		BRIDGE.registerAgent(id, null);
+		src.sendSuccess(() -> Component.literal("spawned agent '" + id + "' (" + type + ")"), false);
+		return 1;
+	}
+
+	private static int cmdPrompt(CommandContext<CommandSourceStack> ctx) {
+		String id = StringArgumentType.getString(ctx, "id");
+		String text = StringArgumentType.getString(ctx, "text");
+		CommandSourceStack src = ctx.getSource();
+		if (!AGENTS.containsKey(id)) {
+			src.sendFailure(Component.literal("no such agent: " + id));
+			return 0;
+		}
+		BRIDGE.setPrompt(id, text);
+		src.sendSuccess(() -> Component.literal("updated prompt for '" + id + "'"), false);
 		return 1;
 	}
 
 	private static int cmdRemove(CommandContext<CommandSourceStack> ctx) {
 		String id = StringArgumentType.getString(ctx, "id");
 		CommandSourceStack src = ctx.getSource();
-		Pig p = AGENTS.remove(id);
+		Mob p = AGENTS.remove(id);
 		if (p == null) {
 			src.sendFailure(Component.literal("no such agent: " + id));
 			return 0;

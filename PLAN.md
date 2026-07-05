@@ -19,13 +19,66 @@ toolchain.
 
 Reference implementation: `../biomata-unity-sdk` — `Runtime/Transport` and
 `Runtime/Models` hold the same JSON protocol, in C#. Translate C# → Java.
-Authoritative wire spec: `../biomata-engine/docs/websocket-protocol.md`.
+Authoritative wire spec: **https://originfoundry.dev/docs/transport** (the live
+engine docs; the old `docs/websocket-protocol.md` file path no longer exists).
+The implementation source of truth is `../biomata-engine/src/transport/websocket/`.
 
 ## End goal
 
 A running Minecraft world where entities are controlled per-tick by AI brains
 in biomata-engine — a fully simulated agent world, observable and playable
 inside Minecraft.
+
+## North star — a reusable simulation framework for human simulacra
+
+The ambition: a **reusable Minecraft simulation framework** on top of
+biomata-engine, for research/study *and* gamedev — as close to **human
+simulacra** (Stanford *Generative Agents*, Park et al. 2023 — "Smallville") as
+the engine allows, embodied in Minecraft. Truly free-willed AI agents that
+perceive, talk, remember, and relate — not scripted NPCs.
+
+**The framing that governs everything:** biomata-minecraft is the *Minecraft
+twin of the Unity SDK*. The engine already IS the simulation framework
+(`ExternalWorld`: host pushes observations, engine returns commands). The mod is
+the **host adapter** — so most of our work is *faithfully implementing the host
+side of contracts the engine already defines*, not inventing new machinery. The
+simulacra scaffolding already exists engine-side: `SimpleMemory` (per-agent
+memory), `WeightedGraphSocial` (relationship graph), `ConversationInbox` (agents
+exchange messages within a tick). What makes it simulacra rather than parallel
+wandering is that agents perceive each other, speak, remember, and relate — all
+supported, currently all unused by us.
+
+### The gap — what the engine offers vs. what we use today
+
+| | Engine offers | We use |
+|---|---|---|
+| Observations | `position`, `nearby_agents`, composable providers | `position` **only** |
+| Actions | idle, move, speak, interact, greet, follow, trade, eat, work, sleep, patrol… (15) | `move` **only** |
+| Roles/capabilities | gate which actions each agent sees | bypassed (raw `brain_class`, empty caps) |
+| Memory / social / inbox | built-in, snapshotable | untouched |
+| Snapshot/restore | engine methods `snapshot`/`restore` | not wired (don't reimplement save/load) |
+
+The engine's own `host_owned/sim.yaml` declares `nearby_agents` for every role —
+we don't even meet that baseline. That is why agents wander in parallel: they are
+blind to each other.
+
+### Roadmap to simulacra (leverage order)
+
+1. **`nearby_agents` observations** — the unlock. Until agents perceive each
+   other, `speak`/`greet`/`follow`/`interact` have no `target` to name. Turns a
+   parallel crowd into a social field. (This is the old Phase 3 #2 gap.)
+2. **Apply `speak`** — render the message in-game (server chat / nametag). It's
+   `kind: hybrid`: engine already routes it through inbox + social graph; the
+   host just displays it. The visible "they're talking" moment.
+3. **Roles + capabilities** — register by role so the engine exposes the full
+   action vocabulary; the mod becomes a role system, not one hardcoded wanderer.
+4. **Generalize into a framework** — an observation assembler + an action
+   dispatcher mirroring Unity's `ObservationProvider`s and `ActionHandlerBase`,
+   so modders extend by adding one class, not editing a switch. *After* 1–3
+   prove the shape, not before.
+
+Memory / reflection / planning (the paper's core) come later and are mostly
+*engine-side brains* — likely not our code at all.
 
 ## Environment (confirmed)
 
