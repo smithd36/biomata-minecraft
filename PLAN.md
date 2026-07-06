@@ -52,9 +52,9 @@ supported, currently all unused by us.
 
 | | Engine offers | We use |
 |---|---|---|
-| Observations | `position`, `nearby_agents`, composable providers | `position` **only** |
-| Actions | idle, move, speak, interact, greet, follow, trade, eat, work, sleep, patrol… (15) | `move` **only** |
-| Roles/capabilities | gate which actions each agent sees | bypassed (raw `brain_class`, empty caps) |
+| Observations | `position`, `nearby_agents`, composable providers | position, nearby_agents/hostiles, hazards, time/light/health, asleep, nearby_objects, incoming_messages ✅ |
+| Actions | idle, move, speak, interact (4 — the engine ships no more; "15" was aspirational) | move, speak, interact ✅ |
+| Roles/capabilities | tags gate engine obs/action *schemas* (host provides obs in host-owned, so obs gating is moot; no gated actions ship) | host-defined roles/caps + capability-gated `interact` actions ✅ |
 | Memory / social / inbox | built-in, snapshotable | untouched |
 | Snapshot/restore | engine methods `snapshot`/`restore` | not wired (don't reimplement save/load) |
 
@@ -64,14 +64,74 @@ blind to each other.
 
 ### Roadmap to simulacra (leverage order)
 
-1. **`nearby_agents` observations** — the unlock. Until agents perceive each
-   other, `speak`/`greet`/`follow`/`interact` have no `target` to name. Turns a
-   parallel crowd into a social field. (This is the old Phase 3 #2 gap.)
-2. **Apply `speak`** — render the message in-game (server chat / nametag). It's
-   `kind: hybrid`: engine already routes it through inbox + social graph; the
-   host just displays it. The visible "they're talking" moment.
-3. **Roles + capabilities** — register by role so the engine exposes the full
-   action vocabulary; the mod becomes a role system, not one hardcoded wanderer.
+1. **`nearby_agents` observations** ✅ (built, pending in-game check) — the
+   unlock. Until agents perceive each other, `speak`/`greet`/`follow`/`interact`
+   have no `target` to name. Turns a parallel crowd into a social field. (Old
+   Phase 3 #2 gap.) `BiomataBridge.sendTick` now attaches `nearby_agents` to each
+   observation: every peer within `NEARBY_RADIUS` (32 blocks) with `id`, `name`,
+   `position`, `distance` — computed from the positions map already passed in, so
+   no new entity access or thread surface. Engine consumes it as-is (HostedWorld).
+   Default prompt updated to reference nearby agents.
+
+   **Environmental awareness** ✅ (built, pending in-game check) — extended
+   observations beyond peers so behaviour can be situation-driven: each tick now
+   also carries `nearby_hostiles` (mobs within 16 blocks, type + distance),
+   `hazards` (`in_water`/`in_lava`/`on_fire`), `time_of_day`, `light_level`, and
+   `health`. In doing so, **observation assembly moved to the server thread**
+   (`BiomataMinecraft.buildObservation`, one small helper per slice — the
+   extensible provider shape); `BiomataBridge` is now pure transport (takes a
+   pre-built `Map<String,Object>` and Gson-serializes it as-is). Needs (hunger/
+   energy) deliberately deferred — those are engine-modelled (`SelfNeedsProvider`
+   + needs extension), not host-readable from a villager.
+2. **Apply `speak`** ✅ (built, pending in-game check) — `kind: hybrid`: engine
+   already routes it through inbox + social graph; the host just displays it.
+   `BiomataBridge` enqueues `speak` decisions (`text`/`message` param) on a
+   concurrent `speech` queue on the WS thread; `END_SERVER_TICK` drains it and
+   broadcasts `<id> text` to chat on the server thread (same thread-split pattern
+   as `moveTargets`). Default prompt now invites speaking on approach. Rendered as
+   server chat for now — floating nametag "speech bubble" is a later polish.
+
+   Also this pass: **spawn made non-opinionated.** The hardcoded entity palette
+   (`CHARACTER_TYPES` + `<type>` command arg) is gone; spawning goes through a
+   single public `CharacterSpawner` seam (defaults to villager) a downstream mod
+   can reassign. Per-agent type selection (prompt / command) will layer on later.
+3. **Roles + capabilities** ✅ (built, pending in-game check) — NB the premise
+   changed on contact with the engine: it ships only **4** verbs
+   (idle/move/speak/interact), **none capability-gated**, and new first-class verbs
+   need Python handlers engine-side (out of scope). So the role vocabulary is
+   **host-defined** and rides the generic `interact` verb. Three public seam maps in
+   `BiomataMinecraft` — `INTERACTIONS` (name → handler+description), `CAPABILITIES`
+   (tag → interactions), `ROLES` (name → body+persona+caps) — populated with example
+   built-ins (a `companion` that can `follow`). `/biomata spawn <id> [role]` embodies
+   the role, registers its capability tags, and composes a persona that tells the LLM
+   how to invoke its interactions; `interact` decisions are dispatched host-side,
+   **gated** by the agent's granted interactions. `/biomata roles` lists them; role
+   persists in the roster. Runtime authoring (command/config) is the deferred layer.
+   The mod is now a role system, not one hardcoded wanderer.
+   **Voluntary behaviors as engine actions (sleep)** ✅ (verified in-game) — the
+   "use MC's own code, engine decides *when*" pattern. `tameAgentAi` keeps MC
+   *capabilities* (doors via `OpenDoorGoal`, swim via `FloatGoal`) while removing
+   autonomous *decisions*; voluntary behaviors are then engine-chosen actions.
+   `sleep` is the first: a self-directed interaction (new `targeted` flag on
+   `Action`, target null) that calls MC's `startSleeping`. It's an **instantaneous
+   handler** — navigation stays the engine's job, so the LLM `move`s to a bed, then
+   `sleep`s; `asleep` is observed so the LLM owns the wake decision (a fresh move
+   target wakes it). Adds no host state (sleep-state is MC-native). Pipeline is
+   generic: eat/sit/work are just more `INTERACTIONS` entries.
+
+   **General perception, not deterministic affordances** ✅ (verified in-game) —
+   the design directive that governs all future actions: the host reports **facts**,
+   the LLM makes **decisions**. Replaced the specific `nearby_beds` slice (and
+   rejected `at_bed`/`time_to_wake` booleans) with a general `nearby_objects`
+   observation (everything notable within `OBJECT_SIGHT`, tagged `notableType` —
+   bed/door/chest/…). The LLM reasons over it ("bed nearby + night → sleep";
+   "asleep + day → move to get up"). Rule: perception is general not per-action; an
+   action's *description* says what it is and how to invoke it, never *when* to
+   choose it; the model is the swappable/improvable backend, so reasoning gaps are
+   fixed with a better model, not host determinism. Invocation plumbing (grant-scoped
+   **aliases** so `use`/`rest` resolve to `sleep`) is how-to-emit, not what-to-decide,
+   and stays.
+
 4. **Generalize into a framework** — an observation assembler + an action
    dispatcher mirroring Unity's `ObservationProvider`s and `ActionHandlerBase`,
    so modders extend by adding one class, not editing a switch. *After* 1–3
@@ -184,11 +244,88 @@ select + describe per agent. No runtime Java authoring.
 - [x] `/biomata list` — list active agent ids
 - [x] IN-GAME CHECK: spawn/list/remove all work from chat ✅
 
+- [x] `/biomata prompt <id> <text...>` — set system prompt (remove+re-register)
+
+**Persistence** ✅ (verified in-game) — the host-authored roster survives a restart
+automatically (no explicit save/load command). Each agent's `{prompt, position}`
+is written to a per-world JSON file (`<world>/biomata_agents.json`) on every
+spawn/remove/prompt and on server stop. On start, the roster loads into
+`PENDING_LOAD`; the tick loop respawns + re-registers each agent once the bridge is
+connected (handles the world-ready vs socket-ready race on the server thread). Only
+host authoring state is persisted; engine runtime state (memory, social) would use
+the engine's own snapshot/restore — separate concern.
+
+Restart hardening (found + fixed in-game): the roster — not the world save — is the
+source of truth for agent bodies. Two hazards handled in `respawnSaved`: (1) the
+world save also persists the villager entity, so it returns as an orphan and used
+to double up → every body carries a `biomata_agent` scoreboard tag and orphans are
+swept before respawn; (2) the engine may still hold the agent from the dropped
+connection → respawn uses remove-then-register (`reRegisterAgent`), else a plain
+register fails `AGENT_EXISTS` and the sim silently freezes (no ticks).
+
+**Conversation (host-routed)** ✅ (verified in-game) — agents greeted
+but never answered because a listener never received the speaker's words. In
+host-owned mode the host's observation is authoritative and the engine's
+`ConversationInbox`/`IncomingMessagesProvider` aren't in our path, so routing speech
+is the host's job. When a `speak` is drained, besides chat it's pushed into every
+nearby agent's `INBOX` (within `NEARBY_AGENT_RADIUS`); `buildObservation` drains
+that into `incoming_messages` (`[{from,text}]`), which the brain renders as
+`=== MESSAGES RECEIVED ===` and replies to. Cross-tick continuity is the engine's
+own per-agent memory (stores a "heard:" line each tick). SYSTEM_INSTRUCTIONS nudges
+agents to answer received messages rather than re-greet. ponytail: broadcast to
+earshot, speaker `target` ignored — add targeting if crosstalk gets noisy.
+
+**Per-agent personality** ✅ (verified in-game) — the differentiation
+lever. Engine renders a uniform `system_prompt` (mechanics) and a *separate*
+per-agent `personality` block (`YOUR CHARACTER`) into each LLM call. So the mod now
+sends a fixed `SYSTEM_INSTRUCTIONS` for all, and `/biomata prompt <id> <text>` sets
+that agent's **persona** (`personality.backstory`), not the system prompt. Was the
+root cause of uniform behavior (all `move`, never `speak`): identical system_prompt
+*and* identical hardcoded persona. Behavior emerges from persona — nothing forced
+host-side.
+
+**Per-agent goals** ✅ (built) — persona says who an agent *is*; goals say what
+it's *trying to do*. The sleep saga exposed the gap: agents were purely reactive (a
+"tired villager" with no daytime drive slept all day). Same lever as persona —
+`/biomata goal <id> <text>` (`;`-separated → list) sets `personality.goals`, which
+the engine renders as a `Goals:` bullet list in the character block. Gives agents a
+*reason* to choose actions non-deterministically. Persists in the roster. (`cmdGoal`
+logs the parsed goals so a bad parse is distinguishable from a bad decision.)
+
+**Diagnosis that goals surfaced — action vocabulary is the bottleneck.** Testing
+goals produced "all the agent does is wander and sleep." Root causes: (1) a `-coder`
+model was used — wrong tool for character/agentic reasoning; use a general/instruct
+model. (2) **A goal can only be pursued through the actions the agent has.** With
+`move`/`speak`/`sleep`/`follow`, only movement/social/rest goals are *expressible*;
+a "farm"/"work" goal has no outlet and collapses to wander+sleep, and a social goal
+needs a second agent to fire on. This is goals working as designed: they name the
+next thing to build. So goals must currently be written to fit existing actions
+("wander the village and greet everyone; sleep at night"), and the roadmap edge is
+now clear → **add concrete actions for goals to reach for.**
+
+### Current edge — what's next (in order)
+
+1. **A general/instruct model + a second agent + goals that fit current actions** —
+   the re-test that validates goals before adding surface. Not code.
+2. **A 3rd concrete action** (e.g. `eat`, or a generic `use <object>` leaning on
+   MC's block-interaction) — gives goals something to express through. Same generic
+   `INTERACTIONS`+capability+role shape as `sleep`; no per-verb plumbing.
+3. **Step 4 — generalize into a framework** (observation assembler + action
+   dispatcher, below) once a 3rd action confirms the shape holds.
+
+Deferred: runtime role authoring (`/biomata role add …` or world JSON);
+`/biomata model <id>` hot-swap; `/biomata entity <type>`.
+
+**Per-agent model** ✅ (verified in-game) — `/biomata spawn <id> [role] [model]`
+overrides the Ollama model per agent (`llm_config.model`; default qwen2.5:14b).
+Confirmed the thesis: gemma is more reliable but slow, qwen 14B faster but weaker —
+cognition scales with the model, so reasoning gaps are a backend concern, not an
+architecture one.
+
 **Next commands** (not built)
-- [ ] `/biomata prompt <id> <text...>` — set system prompt (remove+re-register)
-- [ ] `/biomata model <id> <model>` / `entity <type>` at spawn
+- [ ] `/biomata entity <type>` at spawn — per-agent body (layers on `characterSpawner`)
+- [ ] `/biomata model <id> <model>` — hot-swap a running agent's model (spawn-time exists)
 - [ ] `/biomata actions <id> <action> on|off` — from a fixed palette
-- [ ] `/biomata save <name> | load <name>` — persist a sim to json
 
 ## Guiding principle
 

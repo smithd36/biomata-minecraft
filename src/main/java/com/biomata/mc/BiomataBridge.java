@@ -8,12 +8,15 @@ import com.google.gson.JsonParser;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.WebSocket;
+import java.util.List;
 import java.util.Map;
+import java.util.Queue;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 
 /**
  * Phase 3 — the bridge, now multi-agent. Registers N agents (IdleBrain emitting
@@ -25,8 +28,8 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public final class BiomataBridge {
     private static final String ENGINE_URI  = "ws://localhost:8765";
-    private static final String BRAIN_CLASS = "src.plugins.builtin.ollama.brain.OllamaLLMBrain";
-    private static final String MODEL       = "qwen2.5:14b";
+    private static final String BRAIN_CLASS   = "src.plugins.builtin.ollama.brain.OllamaLLMBrain";
+    private static final String DEFAULT_MODEL = "qwen2.5:14b";
     private static final Gson GSON = new Gson();
 
     private volatile WebSocket ws;
@@ -39,6 +42,13 @@ public final class BiomataBridge {
 
     /** agentId -> {targetX, targetZ}. Written on the WS thread, read on server thread. */
     public final Map<String, double[]> moveTargets = new ConcurrentHashMap<>();
+
+    /** `{agentId, text}` speak events. Written on the WS thread, drained on the server thread. */
+    public final Queue<String[]> speech = new ConcurrentLinkedQueue<>();
+
+    /** `{agentId, interaction, target}` interact events. Written on the WS thread,
+     *  dispatched (capability-gated) on the server thread. */
+    public final Queue<String[]> interactions = new ConcurrentLinkedQueue<>();
 
     public void connect() {
         BiomataMinecraft.LOGGER.info("[biomata] connecting to {}", ENGINE_URI);
@@ -73,6 +83,8 @@ public final class BiomataBridge {
         pending.clear();
         registeredAgents.clear();
         moveTargets.clear();
+        speech.clear();
+        interactions.clear();
         tickInFlight = false;
     }
 
@@ -80,62 +92,106 @@ public final class BiomataBridge {
         return ws != null && !registeredAgents.isEmpty();
     }
 
-    private static final String DEFAULT_PROMPT =
-        "You are a curious character exploring a Minecraft world. You love to roam. "
-        + "Strongly prefer the 'move' action, and when you move include target_x "
-        + "and target_z coordinates a short distance from your current position.";
-
-    /** Register one agent driven by a local Ollama LLM. `prompt` null → default. */
-    public void registerAgent(String agentId, String prompt) {
-        WebSocket s = ws;
-        if (s == null) return;
-        s.sendText(registerFrame(agentId, prompt == null ? DEFAULT_PROMPT : prompt), true);
+    /** True once the WebSocket is open (whether or not any agent is registered yet). */
+    public boolean isConnected() {
+        return ws != null;
     }
 
     /**
-     * Change an agent's system prompt. The engine sets brain config at register
-     * time, so this re-registers: remove_agent then register_agent, chained so
-     * the two sends don't overlap and the engine sees the remove first.
+     * Uniform game mechanics, sent as every agent's {@code system_prompt}: how to
+     * read observations and which actions to use. Deliberately NOT character —
+     * who an agent *is* lives in its per-agent persona (backstory), below.
      */
-    public void setPrompt(String agentId, String prompt) {
+    private static final String SYSTEM_INSTRUCTIONS =
+        "You are a character living in a Minecraft world. Your observation describes "
+        + "your surroundings: 'nearby_agents' (other characters, with id + position), "
+        + "'nearby_hostiles' (dangerous mobs, with type + distance), 'hazards' "
+        + "(e.g. in_water, on_fire, in_lava), 'time_of_day', 'light_level', and your "
+        + "'health'. Use 'move' (with target_x and target_z) to wander, approach "
+        + "someone, or flee danger — move away from hostiles and out of hazards. When "
+        + "another character is close and it feels right, use 'speak' (with a 'text' "
+        + "field) to say something. If you have messages under 'MESSAGES RECEIVED', "
+        + "someone spoke to you — reply to what they actually said instead of "
+        + "greeting again. Use 'interact' for the special interactions listed in your "
+        + "character — some (like resting) act on yourself and need no target, so just "
+        + "set parameters.interaction. If 'asleep' is true you are resting; choosing "
+        + "'move' at any time gets you up. Decide what to do from what you perceive and "
+        + "who you are — e.g. your surroundings, the time of day, and your own state.";
+
+    /** Character for an agent with no authored persona — a blank-slate wanderer. */
+    private static final String DEFAULT_PERSONA =
+        "A curious, restless wanderer who loves to roam and meet others, but values "
+        + "their own safety.";
+
+    /**
+     * Register one agent driven by a local Ollama LLM. `persona` null → default;
+     * `capabilities` are the agent's role capability tags (may be empty).
+     */
+    public void registerAgent(String agentId, String persona, List<String> goals,
+                              List<String> capabilities, String model) {
+        WebSocket s = ws;
+        if (s == null) return;
+        s.sendText(registerFrame(agentId, persona, goals, capabilities, model), true);
+    }
+
+    /**
+     * Re-register: remove_agent *then* register_agent, chained. Used both to
+     * change an agent's persona/capabilities live and on the reconnect/respawn
+     * path — on restart the engine may still hold host-owned agents from the
+     * dropped connection, so a plain register would fail AGENT_EXISTS; the leading
+     * remove clears any stale registration first (a NOT_FOUND warn if there was
+     * none is harmless). Chained so the two sends don't overlap.
+     */
+    public void reRegisterAgent(String agentId, String persona, List<String> goals,
+                                List<String> capabilities, String model) {
         WebSocket s = ws;
         if (s == null) return;
         JsonObject rm = new JsonObject();
         rm.addProperty("agent_id", agentId);
         String removeFrame = request("remove_agent", rm);
-        String registerFrame = registerFrame(agentId, prompt);
-        s.sendText(removeFrame, true).thenCompose(v -> s.sendText(registerFrame, true));
+        String reg = registerFrame(agentId, persona, goals, capabilities, model);
+        s.sendText(removeFrame, true).thenCompose(v -> s.sendText(reg, true));
     }
 
-    /** Build a register_agent frame for one Ollama-driven agent. */
-    private String registerFrame(String agentId, String prompt) {
+    /** Build a register_agent frame for one Ollama-driven agent. `model` null → default. */
+    private String registerFrame(String agentId, String persona, List<String> goals,
+                                 List<String> capabilities, String model) {
         JsonObject llm = new JsonObject();
-        llm.addProperty("model", MODEL);
+        llm.addProperty("model", model == null || model.isEmpty() ? DEFAULT_MODEL : model);
         llm.addProperty("base_url", "http://localhost:11434");
         llm.addProperty("temperature", 0.8);
         llm.addProperty("max_concurrent", 2);
 
-        JsonArray traits = new JsonArray();
-        traits.add("curious");
-        traits.add("restless");
-        JsonArray goals = new JsonArray();
-        goals.add("explore new places");
+        // Persona (backstory) and goals are the differentiation levers: both render
+        // into the agent's per-tick "YOUR CHARACTER" block, distinct from the uniform
+        // mechanics in system_prompt. Goals give the agent a *reason* to act; without
+        // them behaviour is purely reactive. Empty goals → engine default.
+        // ponytail: traits still fall to engine defaults — add if a command needs them.
         JsonObject personality = new JsonObject();
-        personality.add("traits", traits);
-        personality.add("goals", goals);
-        personality.addProperty("backstory", "A wanderer with wanderlust in a blocky world.");
+        personality.addProperty("backstory", persona == null ? DEFAULT_PERSONA : persona);
+        if (goals != null && !goals.isEmpty()) {
+            JsonArray g = new JsonArray();
+            goals.forEach(g::add);
+            personality.add("goals", g);
+        }
 
         JsonObject brainConfig = new JsonObject();
         brainConfig.add("llm_config", llm);
         brainConfig.add("personality", personality);
-        brainConfig.addProperty("system_prompt", prompt);
+        brainConfig.addProperty("system_prompt", SYSTEM_INSTRUCTIONS);
+
+        // Capability tags gate engine-side action/observation schemas by role.
+        // Host-defined actions ride the generic `interact` verb (dispatched
+        // host-side); these tags are the wire-correct record of the agent's role.
+        JsonArray caps = new JsonArray();
+        if (capabilities != null) capabilities.forEach(caps::add);
 
         JsonObject params = new JsonObject();
         params.addProperty("agent_id", agentId);
         params.addProperty("agent_name", agentId);
         params.addProperty("brain_class", BRAIN_CLASS);
         params.add("brain_config", brainConfig);
-        params.add("capabilities", new JsonArray());
+        params.add("capabilities", caps);
         return request("register_agent", params);
     }
 
@@ -156,24 +212,22 @@ public final class BiomataBridge {
         return tickInFlight;
     }
 
-    /** Advance the engine one tick with every agent's position. */
-    public void sendTick(Map<String, double[]> positions) {
+    /**
+     * Advance the engine one tick. Observations are assembled by the caller (on
+     * the server thread, where the world lives); the bridge only serializes and
+     * transports them. Each value is one agent's observation dict — the engine
+     * consumes it as-is (HostedWorld), so its shape is the host's contract.
+     */
+    public void sendTick(Map<String, Map<String, Object>> observations) {
         WebSocket s = ws;
-        if (s == null || positions.isEmpty()) return;
+        if (s == null || observations.isEmpty()) return;
 
         tickInFlight = true;
         JsonArray obsList = new JsonArray();
-        for (var e : positions.entrySet()) {
-            double[] p = e.getValue();
-            JsonObject pos = new JsonObject();
-            pos.addProperty("x", p[0]);
-            pos.addProperty("y", p[1]);
-            pos.addProperty("z", p[2]);
-            JsonObject obs = new JsonObject();
-            obs.add("position", pos);
+        for (var e : observations.entrySet()) {
             JsonObject entry = new JsonObject();
             entry.addProperty("agent_id", e.getKey());
-            entry.add("observation", obs);
+            entry.add("observation", GSON.toJsonTree(e.getValue()));
             obsList.add(entry);
         }
         JsonObject params = new JsonObject();
@@ -233,14 +287,32 @@ public final class BiomataBridge {
                     String action = optString(d, "action");
                     BiomataMinecraft.LOGGER.info("[biomata] {} -> {} {}",
                         agentId, action, d.has("parameters") ? d.get("parameters") : "");
-                    if (!"move".equals(action)) continue;
-                    if (!d.has("parameters") || d.get("parameters").isJsonNull()) continue;
-                    JsonObject p = d.getAsJsonObject("parameters");
-                    if (p.has("target_x") && p.has("target_z")) {
-                        moveTargets.put(agentId, new double[] {
-                            p.get("target_x").getAsDouble(),
-                            p.get("target_z").getAsDouble(),
-                        });
+                    JsonObject p = (d.has("parameters") && !d.get("parameters").isJsonNull())
+                        ? d.getAsJsonObject("parameters") : null;
+                    switch (action) {
+                        case "move" -> {
+                            if (p != null && p.has("target_x") && p.has("target_z")) {
+                                moveTargets.put(agentId, new double[] {
+                                    p.get("target_x").getAsDouble(),
+                                    p.get("target_z").getAsDouble(),
+                                });
+                            }
+                        }
+                        case "speak" -> {
+                            if (p == null) break;
+                            String text = optString(p, "text");
+                            if (text.isEmpty()) text = optString(p, "message");
+                            if (!text.isEmpty()) speech.add(new String[] {agentId, text});
+                        }
+                        case "interact" -> {
+                            // `interaction` + `target` are resolved by the engine's
+                            // interact handler into the engine_command — target rides
+                            // intent.target (top-level), which is NOT echoed in
+                            // `parameters`, so read the command, not the params.
+                            String[] ix = interactCommand(d);
+                            if (ix != null) interactions.add(new String[] {agentId, ix[0], ix[1]});
+                        }
+                        default -> { /* idle — nothing to apply */ }
                     }
                 }
             }
@@ -254,5 +326,25 @@ public final class BiomataBridge {
 
     private static String optString(JsonObject o, String key) {
         return o.has(key) && !o.get(key).isJsonNull() ? o.get(key).getAsString() : "";
+    }
+
+    /**
+     * Pull `{interaction, target}` from a decision's `engine_commands` (the engine
+     * resolves intent.target + the interaction param into the interact command).
+     * Returns null if there's no usable interact command — a bare `interact` with
+     * no named interaction (engine defaults it to the literal "interact") is
+     * ignored here and, being ungranted, would be gated out host-side anyway.
+     */
+    private static String[] interactCommand(JsonObject d) {
+        if (!d.has("engine_commands") || !d.get("engine_commands").isJsonArray()) return null;
+        for (var ec : d.getAsJsonArray("engine_commands")) {
+            if (!ec.isJsonObject()) continue;
+            JsonObject cmd = ec.getAsJsonObject();
+            if (!"interact".equals(optString(cmd, "type"))) continue;
+            String interaction = optString(cmd, "interaction");
+            if (interaction.isEmpty() || interaction.equals("interact")) return null;
+            return new String[] {interaction, optString(cmd, "target")};
+        }
+        return null;
     }
 }
